@@ -2,7 +2,7 @@ import numpy as np
 from gym import spaces
 from gym import Env
 
-from . import register_env
+from rlkit.envs import register_env
 
 
 @register_env('point-robot')

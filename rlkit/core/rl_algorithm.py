@@ -11,6 +11,7 @@ from rlkit.data_management.env_replay_buffer import MultiTaskReplayBuffer
 from rlkit.data_management.path_builder import PathBuilder
 from rlkit.samplers.in_place import InPlacePathSampler, OfflineInPlacePathSampler
 from rlkit.torch import pytorch_util as ptu
+import torch
 
 class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
     def __init__(
@@ -77,6 +78,8 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
         self.eval_statistics                 = None
         self.render_eval_paths               = render_eval_paths
         self.plotter                         = plotter
+
+        self.train_prediction_loss = 0
         
         self.train_buffer      = MultiTaskReplayBuffer(self.replay_buffer_size, env, self.train_tasks, self.goal_radius)
         self.eval_buffer       = MultiTaskReplayBuffer(self.replay_buffer_size, env, self.eval_tasks,  self.goal_radius)
@@ -342,6 +345,24 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
         online_returns = [t[:n] for t in online_returns]
         return final_returns, online_returns
 
+    def _do_eval_online(self, indices, epoch, buffer):
+        final_returns = []
+        online_returns = []
+        for idx in indices:
+            all_rets = []
+            for r in range(self.num_evals):
+                paths = self.collect_paths_online(idx, epoch, r, buffer)
+                all_rets.append([eval_util.get_average_returns([p]) for p in paths])
+            final_returns.append(np.mean([a[-1] for a in all_rets]))
+            # record online returns for the first n trajectories
+            n = min([len(a) for a in all_rets])
+            all_rets = [a[:n] for a in all_rets]
+            all_rets = np.mean(np.stack(all_rets), axis=0) # avg return per nth rollout
+            online_returns.append(all_rets)
+        n = min([len(t) for t in online_returns])
+        online_returns = [t[:n] for t in online_returns]
+        return final_returns, online_returns
+
     def test(self, log_dir, end_point=-1):
         assert os.path.exists(log_dir)
         gt.reset()
@@ -470,6 +491,24 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
             data_dict['z_vars%d' % i] = list(z_vars[:, i])
         return data_dict
 
+
+
+    def get_prediction_error(self,path,right_z):
+        #print(path[0]['observations'].shape)
+        observation = np.concatenate([p['observations'] for p in path],0)
+        action = np.concatenate([p['actions'] for p in path],0)
+        reward = np.concatenate([p['rewards'] for p in path],0)
+        nexto = np.concatenate([p['next_observations'] for p in path],0)
+        o,a,r,no = torch.FloatTensor(observation).to(ptu.device),torch.FloatTensor(action).to(ptu.device),torch.FloatTensor(reward).to(ptu.device),torch.FloatTensor(nexto).to(ptu.device)
+        input_z = right_z.repeat(o.shape[0],1)
+        # print(o.shape,a.shape,input_z.shape,r.shape,no.shape)
+
+        reward_prediction = self.reward_decoder.forward(0,0,input_z.detach(), o, a)
+        no_prediction = self.transition_decoder.forward(0,0,input_z.detach(), o, a)
+        # print(reward_prediction.shape, no_prediction.shape)
+        loss = ((r-reward_prediction)**2).mean()+((no-no_prediction)**2).mean()
+        return loss.detach().cpu().numpy()
+
     def evaluate(self, epoch):
 
         if self.eval_statistics is None:
@@ -518,6 +557,8 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
                         p['rewards'] = sparse_rewards
 
                 train_returns.append(eval_util.get_average_returns(paths))
+
+
             ### eval train tasks with on-policy data to match eval of test tasks
             train_final_returns, train_online_returns = self._do_eval(indices, epoch, buffer=self.train_buffer)
             eval_util.dprint('train online returns')
@@ -528,6 +569,11 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
             test_final_returns, test_online_returns = self._do_eval(self.eval_tasks, epoch, buffer=self.eval_buffer)
             eval_util.dprint('test online returns')
             eval_util.dprint(test_online_returns)
+
+            eval_util.dprint('evaluating online on {} test tasks'.format(len(self.eval_tasks)))
+            test_final_returns_online, test_online_returns_online = self._do_eval_online(self.eval_tasks, epoch, buffer=self.eval_buffer)
+            eval_util.dprint('online test online returns')
+            eval_util.dprint(test_online_returns_online)
 
             # save the final posterior
             self.agent.log_diagnostics(self.eval_statistics)
@@ -541,6 +587,7 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
                 self.eval_statistics[f'AverageTrainReturn_train_task{i}'] = train_returns[i]
                 self.eval_statistics[f'AverageReturn_all_train_task{i}'] = train_final_returns[i]
                 self.eval_statistics[f'AverageReturn_all_test_tasks{i}'] = test_final_returns[i]
+                self.eval_statistics[f'AverageReturn_all_test_tasks{i}_online'] = test_final_returns_online[i]
 
         # non {}-dir envs
         else:
@@ -571,6 +618,69 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
                 train_returns.append(eval_util.get_average_returns(paths))
             train_returns = np.mean(train_returns)
             ### eval train tasks with on-policy data to match eval of test tasks
+
+            train_keys = []
+            for i in self.train_buffer.task_buffers.keys():
+                train_keys.append(i)
+            idx = train_keys[0]
+            self.agent.clear_z()
+            self.env.reset_task(idx)
+            batch_dict = self.train_buffer.task_buffers[idx].random_batch(1024)
+            self.agent.update_context_dict(batch_dict=batch_dict, env=self.env)
+            self.agent.infer_posterior(self.agent.context, task_indices=idx)
+            right_z = self.agent.z.clone()
+            prediction_errors = []
+            returns = []
+            path, num = self.offline_sampler.obtain_samples_online(
+                buffer=self.eval_buffer,
+                deterministic=self.eval_deterministic,
+                max_samples=10000,
+                max_trajs=5,
+                accum_context=True,
+                rollout=True)
+            prediction_error = self.get_prediction_error(path, right_z)
+            avgreturn = np.mean([eval_util.get_average_returns([p]) for p in path])
+            prediction_errors.append(prediction_error)
+            returns.append(avgreturn)
+            for i in range(1,20):
+                idx = train_keys[i]
+                self.agent.clear_z()
+                batch_dict = self.train_buffer.task_buffers[idx].random_batch(1024)
+                self.agent.update_context_dict(batch_dict=batch_dict, env=self.env)
+                self.agent.infer_posterior(self.agent.context, task_indices=idx)
+                path, num = self.offline_sampler.obtain_samples_online(
+                    buffer=self.eval_buffer,
+                    deterministic=self.eval_deterministic,
+                    max_samples=10000,
+                    max_trajs=5,
+                    accum_context=True,
+                    rollout=True)
+                prediction_error = self.get_prediction_error(path, self.agent.z)
+                avgreturn = np.mean([eval_util.get_average_returns([p]) for p in path])
+                prediction_errors.append(prediction_error)
+                returns.append(avgreturn)
+            prediction_errors = np.array(prediction_errors)
+            returns = np.array(returns)
+            eval_util.dprint('prediction errors: oracle, mean,min,max')
+            eval_util.dprint(prediction_errors[0], np.mean(prediction_errors), np.min(prediction_errors[1:]),
+                             np.max(prediction_errors[1:]))
+            accepted = (prediction_errors < (self.train_prediction_loss*10)).astype(float)
+            if np.sum(accepted) ==0:
+                accepted[np.argmin(prediction_errors[1:])+1] = 1
+            accepted_return = np.sum(returns*accepted) / (np.sum(accepted)+1e-5)
+            refused_return = np.sum(returns*(1-accepted)) / (np.sum(1-accepted)+1e-5)
+            self.eval_statistics[f'Num_Accepted'] = np.sum(accepted)
+            self.eval_statistics[f'Accpeted_Return'] = accepted_return
+            self.eval_statistics[f'Refused_Return'] = refused_return
+            self.eval_statistics[f'Oracle_Return'] = returns[0]
+            self.eval_statistics[f'Returns_All'] = returns
+            self.eval_statistics[f'Prediction_Error_Train'] = self.train_prediction_loss
+            self.eval_statistics[f'Prediction_Errors_All'] = prediction_errors
+            self.eval_statistics[f'Oracle_Prediction_Loss'] = prediction_errors[0]
+            self.eval_statistics[f'Mean_Prediction_Loss'] = np.mean(prediction_errors)
+            self.eval_statistics[f'Min_Prediction_Loss'] = np.min(prediction_errors)
+            self.eval_statistics[f'Max_Prediction_Loss'] = np.max(prediction_errors)
+
             train_final_returns, train_online_returns = self._do_eval(indices, epoch, buffer=self.train_buffer)
             eval_util.dprint('train online returns')
             eval_util.dprint(train_online_returns)
@@ -581,6 +691,12 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
             eval_util.dprint('test online returns')
             eval_util.dprint(test_online_returns)
 
+            eval_util.dprint('evaluating online on {} test tasks'.format(len(self.eval_tasks)))
+            test_final_returns_online, test_online_returns_online = self._do_eval_online(self.eval_tasks, epoch,
+                                                                                         buffer=self.eval_buffer)
+            eval_util.dprint('online test online returns')
+            eval_util.dprint(test_online_returns_online)
+
             # save the final posterior
             self.agent.log_diagnostics(self.eval_statistics)
 
@@ -589,11 +705,13 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
 
             avg_train_return = np.mean(train_final_returns)
             avg_test_return = np.mean(test_final_returns)
+            avg_test_return_online = np.mean(test_final_returns_online)
             avg_train_online_return = np.mean(np.stack(train_online_returns), axis=0)
             avg_test_online_return = np.mean(np.stack(test_online_returns), axis=0)
             self.eval_statistics['AverageTrainReturn_all_train_tasks'] = train_returns
             self.eval_statistics['AverageReturn_all_train_tasks'] = avg_train_return
             self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
+            self.eval_statistics['AverageReturn_all_test_tasks_online'] = avg_test_return_online
 
             self.loss['train_returns'] = train_returns
             self.loss['avg_train_return'] = avg_train_return
@@ -624,6 +742,41 @@ class OfflineMetaRLAlgorithm(metaclass=abc.ABCMeta):
         # num_trajs = 0
         while num_transitions < self.num_steps_per_eval:
             path, num = self.offline_sampler.obtain_samples(
+                buffer=buffer,
+                deterministic=self.eval_deterministic,
+                max_samples=self.num_steps_per_eval - num_transitions,
+                max_trajs=1,
+                accum_context=True,
+                rollout=True)
+            paths += path
+            num_transitions += num
+
+        if self.sparse_rewards:
+            for p in paths:
+                sparse_rewards = np.stack(e['sparse_reward'] for e in p['env_infos']).reshape(-1, 1)
+                p['rewards'] = sparse_rewards
+
+        goal = self.env._goal
+        for path in paths:
+            path['goal'] = goal # goal
+
+        # save the paths for visualization, only useful for point mass
+        if self.dump_eval_paths:
+            logger.save_extra_data(paths, path='eval_trajectories/task{}-epoch{}-run{}'.format(idx, epoch, run))
+
+        return paths
+
+
+    def collect_paths_online(self, idx, epoch, run, buffer):
+        self.task_idx = idx
+        self.env.reset_task(idx)
+
+        self.agent.clear_z()
+        paths = []
+        num_transitions = 0
+        # num_trajs = 0
+        while num_transitions < self.num_steps_per_eval:
+            path, num = self.offline_sampler.obtain_samples_online(
                 buffer=buffer,
                 deterministic=self.eval_deterministic,
                 max_samples=self.num_steps_per_eval - num_transitions,

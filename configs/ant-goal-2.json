@@ -1,13 +1,11 @@
 {
-    "env_name": "sparse-point-robot",
-    "n_train_tasks": 80,
+    "env_name": "ant-goal",
+    "n_train_tasks": 60,
     "n_eval_tasks": 20,
     "seed_list": [21,22,23],
     "randomize_tasks": 1,
     "env_params": {
-        "n_tasks": 100,
-        "goal_radius": -0.2,
-        "randomize_tasks": 0
+        "n_tasks": 80
     },
     "algo_params": {
         "meta_batch":16,
@@ -21,7 +19,7 @@
         "num_steps_per_eval": 400,
         "embedding_batch_size": 1024,
         "embedding_mini_batch_size": 1024,
-        "max_path_length": 20,
+        "max_path_length": 200,
         "discount": 0.90,
         "reward_scale": 100.0,
         "sparse_rewards": 0,
@@ -33,7 +31,7 @@
         "sample": 1,
         "n_trj": 50,
         "agent_type": "Contrastive",
-        "data_dir": "./data/sparse-point-robot",
+        "data_dir": "./data/ant-2",
         "divergence_name": "kl",
         "use_brac": 0
     },

@@ -105,6 +105,130 @@ def offline_rollout(env, agent, buffer, max_path_length=np.inf, accum_context=Tr
         env_infos=env_infos,
     )
 
+def offline_rollout_online(env, agent, buffer, max_path_length=np.inf, accum_context=True, animated=False, save_frames=False):
+    # perform online rollout as in rollout()
+    # If accum_context=True, aggregate offline context
+    # print(buffer.task_buffers.keys())
+    # batch_dict = buffer.task_buffers[env._goal_idx].random_batch(max_path_length)
+
+    # max_batch = buffer.task_buffers[env._goal_idx].random_batch(10000)
+    # import matplotlib.pyplot as plt
+    # plt.figure()
+    # print(max_batch['observations'][0,0],max_batch['observations'][0,1])
+    # for i in range(10000):
+    #     print(max_batch['observations'][i, 0], max_batch['observations'][i, 1],i)
+    #     plt.scatter(max_batch['observations'][i,0],max_batch['observations'][i,1])
+    # plt.xlim([-1.55, 1.55])
+    # plt.ylim([-0.55, 1.55])
+    # plt.savefig('/home/lthpc/Desktop/FOCAL-ICLR/2.png')
+
+
+    # plt.show()
+
+    # observations = batch_dict['observations']
+    # actions = batch_dict['actions']
+    # rewards = batch_dict['rewards']
+    # terminals = batch_dict['terminals']
+    # next_observations = batch_dict['next_observations']
+    observations = []
+    actions = []
+    rewards = []
+    terminals = []
+    next_observations = []
+    agent_infos = [{} for _ in actions]
+    env_infos = [{} for _ in actions]
+    path_length = 0
+
+    if callable(getattr(env, "sparsify_rewards", None)):
+        env_infos = [{'sparse_reward': env.sparsify_rewards(r)} for r in rewards]
+    # batch_dict = dict(
+    #     observations=self._observations[indices],
+    #     actions=self._actions[indices],
+    #     rewards=self._rewards[indices],
+    #     terminals=self._terminals[indices],
+    #     next_observations=self._next_obs[indices],
+    #     sparse_rewards=self._sparse_rewards[indices],
+    # )
+    idx = 0
+
+
+    # if accum_context:
+    #     # update the agent's current context
+    #     # while idx < max_path_length:
+    #     #     o = batch_dict['observations'][idx]
+    #     #     a = batch_dict['actions'][idx]
+    #     #     r = batch_dict['rewards'][idx]
+    #     #     t = batch_dict['terminals'][idx]
+    #     #     next_o = batch_dict['next_observations'][idx]
+    #     #     if callable(getattr(env, "sparsify_rewards", None)):
+    #     #         env_info = {'sparse_reward': env.sparsify_rewards(r)}
+    #     #     else:
+    #     #         env_info = {}
+    #     #     print(o, a, r, o.shape, a.shape, r.shape)
+    #     #     agent.update_context([o, a, r, next_o, t, env_info])
+    #     #     idx += 1
+    #     agent.update_context_dict(batch_dict=batch_dict, env=env)
+    #
+    # agent.infer_posterior(agent.context, task_indices=env._goal_idx)
+
+    o = env.reset()
+    # perform online evaluation
+    while path_length < max_path_length:
+        logging.info('task_indices:')
+        logging.info(agent.task_indices)
+        logging.info('z')
+        logging.info(agent.z)
+        logging.info('o:')
+        logging.info(o)
+        a, agent_info = agent.get_action(o)
+        next_o, r, d, env_info = env.step(a)
+        if accum_context:
+            agent.update_context([o, a, r, next_o, d, env_info])
+        logging.info('next_o:')
+        logging.info(next_o)
+        logging.info('a')
+        logging.info(a)
+        logging.info('r')
+        logging.info(r)
+        observations.append(o)
+        rewards.append(r)
+        terminals.append(d)
+        actions.append(a)
+        next_observations.append(next_o)
+        agent_infos.append(agent_info)
+        path_length += 1
+        o = next_o
+        if animated:
+            env.render()
+        if save_frames:
+            from PIL import Image
+            image = Image.fromarray(np.flipud(env.get_image()))
+            env_info['frame'] = image
+        env_infos.append(env_info)
+        if d:
+            break
+
+    actions = np.array(actions)
+    if len(actions.shape) == 1:
+        actions = np.expand_dims(actions, 1)
+    observations = np.array(observations)
+    if len(observations.shape) == 1:
+        observations = np.expand_dims(observations, 1)
+    next_observations = np.array(next_observations)
+    if len(next_observations.shape) == 1:
+        next_observations = np.expand_dims(next_observations, 1)
+
+    return dict(
+        observations=observations,
+        actions=actions,
+        rewards=np.array(rewards).reshape(-1, 1),
+        next_observations=next_observations,
+        terminals=np.array(terminals).reshape(-1, 1),
+        agent_infos=agent_infos,
+        env_infos=env_infos,
+    )
+
+
 
 def offline_sample(env, agent, buffer, max_path_length=np.inf, accum_context=True):
     """
